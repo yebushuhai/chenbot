@@ -540,11 +540,6 @@ class _HomeState extends State<Home> {
           letterSpacing: -1,
         ),
       ),
-      const SizedBox(height: 10),
-      const Text(
-        '拍下身边的事物，让每张照片成为一堂小课。',
-        style: TextStyle(color: Color(0xff738279), height: 1.5),
-      ),
       const SizedBox(height: 24),
       Container(
         padding: const EdgeInsets.all(22),
