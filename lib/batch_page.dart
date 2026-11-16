@@ -7,17 +7,27 @@ import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
 import 'batch_store.dart';
-import 'dev_recognition.dart';
+import 'deepseek_recognition.dart';
+import 'deepseek_account.dart';
+import 'english_level.dart';
+import 'english_level_colors.dart';
+import 'english_level_page.dart';
+import 'deepseek_settings.dart';
+import 'recognition_pipeline.dart';
+import 'vocabulary.dart';
+import 'vocabulary_widgets.dart';
 
 class BatchPage extends StatefulWidget {
   const BatchPage({
     super.key,
     required this.japanese,
     this.storeOverride,
+    this.serviceFactory,
     this.storageScope = 'guest',
   });
   final bool japanese;
   final BatchStore? storeOverride;
+  final DeepSeekRecognition Function()? serviceFactory;
   final String storageScope;
   @override
   State<BatchPage> createState() => _BatchPageState();
@@ -29,7 +39,8 @@ class _BatchPageState extends State<BatchPage> {
   final speech = FlutterTts();
   List<Map<String, dynamic>> photos = [], cards = [], favorites = [];
   int index = 0, completed = 0, total = 0;
-  bool busy = false, stop = false;
+  int refreshVersion = 0;
+  bool busy = false, stop = false, deepSeekConfigured = false;
   String? problem;
   @override
   void initState() {
@@ -49,21 +60,52 @@ class _BatchPageState extends State<BatchPage> {
         store = BatchStore(Directory('${dir.path}/chenbot_batch/$scope'));
       }
       await refresh();
+      await refreshDeepSeekSettings();
     } catch (_) {
       if (mounted) setState(() => problem = '无法读取本机数据，请检查设备存储空间。');
     }
   }
 
+  Future<void> refreshDeepSeekSettings() async {
+    try {
+      final present = await DeepSeekKeyStore(widget.storageScope).hasKey();
+      if (mounted) setState(() => deepSeekConfigured = present);
+    } catch (_) {
+      if (mounted) setState(() => deepSeekConfigured = false);
+    }
+  }
+
+  Future<void> openDeepSeekSettings() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DeepSeekSettingsPage(scope: widget.storageScope),
+      ),
+    );
+    if (mounted) await refreshDeepSeekSettings();
+  }
+
   Future<void> refresh() async {
     final s = store;
     if (s == null) return;
-    final p = await s.photos(), c = await s.cards(), f = await s.favorites();
-    if (!mounted) return;
+    final version = ++refreshVersion;
+    final p = await s.photos(),
+        c = await s.visibleCards(),
+        f = await s.visibleFavorites();
+    final profile = widget.japanese
+        ? null
+        : await EnglishLevelProfile.load(widget.storageScope);
+    if (!mounted || version != refreshVersion) return;
     setState(() {
       final language = widget.japanese ? 'ja' : 'en';
       photos = p.where((x) => x['language'] == language).toList();
       cards = c
-          .where((x) => x['discarded'] != true && x['language'] == language)
+          .where(
+            (x) =>
+                x['discarded'] != true &&
+                x['language'] == language &&
+                englishCardMatchesBand(x, profile?.band),
+          )
           .toList();
       favorites = f;
       if (index >= cards.length) index = cards.isEmpty ? 0 : cards.length - 1;
@@ -133,7 +175,7 @@ class _BatchPageState extends State<BatchPage> {
         });
       }
     }
-    if (mounted && !cancelled && added.isNotEmpty && DevRecognition.enabled) {
+    if (mounted && !cancelled && added.isNotEmpty && deepSeekConfigured) {
       await process(added);
     }
   }
@@ -141,57 +183,117 @@ class _BatchPageState extends State<BatchPage> {
   Future<void> process([List<Map<String, dynamic>>? selected]) async {
     final s = store;
     if (busy || s == null) return;
-    if (!DevRecognition.enabled) {
-      message('AI 服务尚未配置，照片保留在本机等待处理。');
-      return;
-    }
     final pending =
         selected ??
         photos
-            .where((p) => p['status'] == 'queued' || p['status'] == 'failed')
+            .where(
+              (p) =>
+                  p['status'] == 'queued' ||
+                  p['status'] == 'failed' ||
+                  p['status'] == 'no_match',
+            )
             .toList();
     if (pending.isEmpty) {
       message('没有待处理的照片。');
       return;
     }
+    String? key;
+    try {
+      key = await DeepSeekKeyStore(widget.storageScope).read();
+    } catch (_) {
+      message('无法读取本机密钥，请检查 DeepSeek 识图设置。');
+      return;
+    }
+    if (!mounted) return;
+    if (key == null || key.isEmpty) {
+      message('请先设置 DeepSeek API Key，照片保留在本机。');
+      await openDeepSeekSettings();
+      return;
+    }
+    EnglishLevelProfile? profile;
+    Map<String, bool> practice = {};
+    try {
+      profile = await EnglishLevelProfile.load(widget.storageScope);
+      practice = await VocabularyPractice.load(widget.storageScope);
+    } catch (_) {
+      // Do not upload English images without a valid difficulty preference.
+    }
+    if (!mounted) return;
+    if (pending.any((photo) => photo['language'] == 'en') && profile == null) {
+      message('请先选择英语识图等级。');
+      return;
+    }
+    final approved = await confirmDeepSeekUpload(context, pending.length);
+    if (!approved || !mounted) return;
     setState(() {
       busy = true;
       completed = 0;
       total = pending.length;
       stop = false;
     });
-    var failed = 0;
+    String? failure;
+    var exhausted = 0;
+    var noMatchingWords = 0;
+    late final DeepSeekRecognition service;
+    if (widget.serviceFactory != null) {
+      service = widget.serviceFactory!();
+    } else {
+      service = DeepSeekRecognition(
+        onUsage: DeepSeekUsageStore(widget.storageScope).record,
+        englishLevel: profile?.band.difficulty,
+      );
+    }
     try {
       for (final photo in pending) {
         if (stop || !mounted) break;
         try {
-          final file = File('${s.root.path}/${photo['file']}');
-          final words = await DevRecognition.recognize(
-            await file.readAsBytes(),
-            photo['language'] as String,
+          final result = await recognizeForLearner(
+            image: await s.readPhoto(photo),
+            language: photo['language'] as String,
+            key: key,
+            service: service,
+            store: s,
+            englishLevel: profile?.band.difficulty,
+            practice: practice,
           );
-          await s.saveResults(photo, words);
-        } catch (_) {
-          failed++;
+          await s.saveResults(photo, result.words);
+          if (result.noMatchingWords) {
+            noMatchingWords++;
+          } else if (result.exhausted) {
+            exhausted++;
+          }
+        } catch (error) {
+          failure = error is DeepSeekException
+              ? error.message
+              : '无法处理照片或保存结果，请检查设备存储后重试。';
           try {
             await s.setStatus(photo['id'] as String, 'failed');
           } catch (_) {
             message('无法保存处理状态，请检查存储空间。');
           }
+          if (mounted) setState(() => completed++);
+          break;
         }
         if (mounted) setState(() => completed++);
       }
       await refresh();
-      if (failed > 0) {
-        message('$failed 张照片识别失败，仍保存在本机，可重试。');
+      if (failure != null) {
+        message('处理已暂停：$failure 照片保留在本机，可重试。');
       } else if (stop) {
         message('已停止处理，剩余照片保留待重试。');
       } else {
-        message('照片处理完成。');
+        message(
+          noMatchingWords > 0
+              ? '处理完成，$noMatchingWords 张照片重新识别后仍没有符合等级且在词频表中的物品词。'
+              : exhausted > 0
+              ? '处理完成，$exhausted 张照片没有可显示的新物品，可查看垃圾桶或换张照片。'
+              : '照片处理完成。',
+        );
       }
     } catch (_) {
       message('无法保存处理结果，请检查设备存储空间。');
     } finally {
+      service.close();
       if (mounted) {
         setState(() {
           busy = false;
@@ -211,6 +313,65 @@ class _BatchPageState extends State<BatchPage> {
     }
   }
 
+  Future<void> favoriteCard(Map<String, dynamic> card) async {
+    try {
+      await store!.favorite(card);
+      await refresh();
+      message('已收藏 ${card['word']}。');
+    } catch (_) {
+      message('收藏失败，请检查本机存储。');
+    }
+  }
+
+  Future<void> moveCard(Map<String, dynamic> card, Offset position) async {
+    try {
+      await store!.moveLabel(card['id'] as String, position.dx, position.dy);
+      if (mounted) {
+        setState(() {
+          card['labelX'] = position.dx;
+          card['labelY'] = position.dy;
+        });
+      }
+    } catch (_) {
+      message('无法保存单词位置，请检查本机存储。');
+    }
+  }
+
+  Future<void> discardCard(Map<String, dynamic> card) async {
+    try {
+      await store!.discard(card['id'] as String);
+      await refresh();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已将 ${card['word']} 和已识别的词形放入垃圾桶。'),
+          action: SnackBarAction(
+            label: '撤销',
+            onPressed: () async {
+              try {
+                await store!.restoreMatching(card);
+                await refresh();
+              } catch (_) {
+                message('恢复失败，请检查本机存储。');
+              }
+            },
+          ),
+        ),
+      );
+    } catch (_) {
+      message('操作失败，请重试。');
+    }
+  }
+
+  Future<void> openTrash() async {
+    if (store == null) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(builder: (_) => LocalTrashPage(store: store!)),
+    );
+    await refresh();
+  }
+
   Future<void> actionSheet() async {
     if (cards.isEmpty || busy || store == null) return;
     final card = cards[index];
@@ -227,28 +388,16 @@ class _BatchPageState extends State<BatchPage> {
               subtitle: const Text('单独保存到本机收藏'),
               onTap: () async {
                 Navigator.pop(ctx);
-                try {
-                  await store!.favorite(card);
-                  await refresh();
-                  message('已收藏单词。');
-                } catch (_) {
-                  message('收藏失败，请检查本机存储。');
-                }
+                await favoriteCard(card);
               },
             ),
             ListTile(
               leading: const Icon(Icons.hide_source),
               title: const Text('Discard · 移出卡片流'),
-              subtitle: const Text('本机照片保留，其他词条不受影响'),
+              subtitle: const Text('放入垃圾桶，之后过滤这个词及已识别的词形'),
               onTap: () async {
                 Navigator.pop(ctx);
-                try {
-                  await store!.discard(card['id'] as String);
-                  await refresh();
-                  message('已移出卡片流。');
-                } catch (_) {
-                  message('操作失败，请重试。');
-                }
+                await discardCard(card);
               },
             ),
             const SizedBox(height: 16),
@@ -275,9 +424,22 @@ class _BatchPageState extends State<BatchPage> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
+    floatingActionButton: cards.isNotEmpty && !busy
+        ? Material(
+            elevation: 5,
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(18),
+            child: TrashDropTarget(onDiscard: discardCard),
+          )
+        : null,
     appBar: AppBar(
       title: const Text('批量识词'),
       actions: [
+        IconButton(
+          onPressed: busy ? null : openDeepSeekSettings,
+          icon: const Icon(Icons.key_outlined),
+          tooltip: 'DeepSeek 识图设置',
+        ),
         IconButton(
           onPressed: () => Navigator.push(
             context,
@@ -285,6 +447,11 @@ class _BatchPageState extends State<BatchPage> {
           ),
           icon: const Icon(Icons.bookmark_outline),
           tooltip: '本机收藏',
+        ),
+        IconButton(
+          onPressed: openTrash,
+          icon: const Icon(Icons.delete_outline),
+          tooltip: '单词垃圾桶',
         ),
       ],
     ),
@@ -301,6 +468,14 @@ class _BatchPageState extends State<BatchPage> {
                   style: const TextStyle(color: Colors.blueGrey),
                 ),
                 const SizedBox(height: 8),
+                if (!widget.japanese)
+                  IgnorePointer(
+                    ignoring: busy,
+                    child: EnglishDifficultySelector(
+                      scope: widget.storageScope,
+                      onChanged: (_) => refresh(),
+                    ),
+                  ),
                 Wrap(
                   spacing: 8,
                   runSpacing: 6,
@@ -311,18 +486,22 @@ class _BatchPageState extends State<BatchPage> {
                       label: const Text('选择多张照片'),
                     ),
                     FilledButton(
-                      onPressed: busy ? null : () => process(),
+                      onPressed: busy
+                          ? null
+                          : deepSeekConfigured
+                          ? () => process()
+                          : openDeepSeekSettings,
                       child: Text(
-                        DevRecognition.enabled ? '开发测试：处理照片' : '等待识图服务',
+                        deepSeekConfigured ? '处理待识别照片' : '设置 API Key',
                       ),
                     ),
                   ],
                 ),
                 const SizedBox(height: 6),
                 Text(
-                  DevRecognition.enabled
-                      ? '选择照片后会逐张发送至 DeepSeek，模型调用可能产生费用。'
-                      : '识图服务未配置，选中的照片只保存在本机。',
+                  deepSeekConfigured
+                      ? '确认后逐张发送到 DeepSeek，使用你自己的 API 额度。'
+                      : '请先设置自己的 DeepSeek API Key；未确认发送前照片保存在本机。',
                   style: const TextStyle(fontSize: 12, color: Colors.blueGrey),
                 ),
                 if (busy) ...[
@@ -336,7 +515,7 @@ class _BatchPageState extends State<BatchPage> {
                       const Spacer(),
                       TextButton(
                         onPressed: () => setState(() => stop = true),
-                        child: const Text('停止'),
+                        child: const Text('本张完成后停止'),
                       ),
                     ],
                   ),
@@ -354,7 +533,7 @@ class _BatchPageState extends State<BatchPage> {
                       child: Text(
                         photos.isEmpty
                             ? '选择照片开始。'
-                            : '已保存 ${photos.length} 张照片，等待识别。',
+                            : '已保存 ${photos.length} 张照片。当前等级没有可显示的词时，可调整等级或选择其他照片。',
                         textAlign: TextAlign.center,
                       ),
                     ),
@@ -401,61 +580,91 @@ class _BatchPageState extends State<BatchPage> {
         LabeledPhoto(
           file: File('${store!.root.path}/${card['file']}'),
           card: card,
+          onFavorite: () => favoriteCard(card),
+          onPositionChanged: (position) => moveCard(card, position),
         ),
         Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Wrap(
+            spacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      card['word'] as String,
-                      style: const TextStyle(
-                        fontSize: 30,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                  ),
-                  IconButton.filledTonal(
-                    onPressed: () => speak(card),
-                    icon: const Icon(Icons.volume_up_outlined),
-                    tooltip: '播放发音',
-                  ),
-                ],
-              ),
-              if ((card['reading'] as String).isNotEmpty)
-                Text(
-                  card['reading'] as String,
-                  style: const TextStyle(color: Colors.blueGrey),
-                ),
-              const SizedBox(height: 14),
-              Text(
-                card['zh'] as String,
-                style: const TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                card['en_definition'] as String,
-                style: const TextStyle(height: 1.5),
-              ),
-              const Divider(height: 32),
-              const Text('例句', style: TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 8),
-              Text(
-                card['example'] as String,
-                style: const TextStyle(fontSize: 16, height: 1.5),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                card['example_zh'] as String,
-                style: const TextStyle(color: Colors.blueGrey),
+              if (card['kind'] == 'adjective')
+                VocabularyTag(card: card, onFavorite: () => favoriteCard(card)),
+              IconButton(
+                onPressed: () => discardCard(card),
+                icon: const Icon(Icons.delete_outline),
+                tooltip: '放入垃圾桶',
               ),
             ],
+          ),
+        ),
+        Container(
+          color: englishWordColor(card),
+          padding: const EdgeInsets.all(20),
+          child: DefaultTextStyle.merge(
+            style: TextStyle(color: wordTextColor(englishWordColor(card))),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        card['word'] as String,
+                        style: const TextStyle(
+                          fontSize: 30,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    IconButton.filledTonal(
+                      onPressed: () => speak(card),
+                      icon: const Icon(Icons.volume_up_outlined),
+                      tooltip: '播放发音',
+                    ),
+                  ],
+                ),
+                if ((card['reading'] as String).isNotEmpty)
+                  Text(
+                    card['reading'] as String,
+                    style: TextStyle(
+                      color: wordTextColor(englishWordColor(card))
+                          .withValues(alpha: .7),
+                    ),
+                  ),
+                const SizedBox(height: 14),
+                Text(
+                  card['zh'] as String,
+                  style: const TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  card['en_definition'] as String,
+                  style: const TextStyle(height: 1.5),
+                ),
+                const Divider(height: 32),
+                const Text('例句', style: TextStyle(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 8),
+                Text(
+                  card['example'] as String,
+                  style: const TextStyle(fontSize: 16, height: 1.5),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  card['example_zh'] as String,
+                  style: TextStyle(
+                    color: wordTextColor(englishWordColor(card))
+                        .withValues(alpha: .7),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                const Text('AI 生成内容，仅供学习参考', style: TextStyle(fontSize: 12)),
+              ],
+            ),
           ),
         ),
       ],
@@ -495,7 +704,7 @@ class _LocalFavoritesState extends State<LocalFavorites> {
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('本机收藏')),
     body: FutureBuilder<List<Map<String, dynamic>>>(
-      future: widget.store?.favorites() ?? Future.value([]),
+      future: widget.store?.visibleFavorites() ?? Future.value([]),
       builder: (context, snapshot) {
         if (snapshot.hasError) return const Center(child: Text('无法读取收藏。'));
         if (!snapshot.hasData) {
@@ -545,9 +754,17 @@ class _LocalFavoritesState extends State<LocalFavorites> {
 }
 
 class LabeledPhoto extends StatefulWidget {
-  const LabeledPhoto({super.key, required this.file, required this.card});
+  const LabeledPhoto({
+    super.key,
+    required this.file,
+    required this.card,
+    required this.onFavorite,
+    this.onPositionChanged,
+  });
   final File file;
   final Map<String, dynamic> card;
+  final VoidCallback onFavorite;
+  final ValueChanged<Offset>? onPositionChanged;
   @override
   State<LabeledPhoto> createState() => _LabeledPhotoState();
 }
@@ -591,55 +808,15 @@ class _LabeledPhotoState extends State<LabeledPhoto> {
           return const Center(child: Text('正在载入照片…'));
         }
         final ratio = snapshot.data!.width / snapshot.data!.height;
-        return LayoutBuilder(
-          builder: (context, bounds) {
-            final width = bounds.maxWidth < 260 * ratio
-                ? bounds.maxWidth
-                : 260 * ratio;
-            final height = width / ratio;
-            final box = widget.card['box'];
-            return Center(
-              child: SizedBox(
-                width: width,
-                height: height,
-                child: Stack(
-                  fit: StackFit.expand,
-                  children: [
-                    Image.file(widget.file, fit: BoxFit.fill),
-                    if (box is List &&
-                        box.length == 4 &&
-                        box.every((v) => v is num && v >= 0 && v <= 1))
-                      Positioned(
-                        left: ((box[0] as num).toDouble() * width).clamp(
-                          0.0,
-                          (width - 120).clamp(0.0, width),
-                        ),
-                        top: ((box[1] as num).toDouble() * height).clamp(
-                          0.0,
-                          (height - 34).clamp(0.0, height),
-                        ),
-                        child: Container(
-                          constraints: const BoxConstraints(maxWidth: 120),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            color: Colors.white.withValues(alpha: .94),
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Text(
-                            widget.card['word'] as String,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            );
-          },
+        return VocabularyPhotoCanvas(
+          image: Image.file(widget.file, fit: BoxFit.fill),
+          aspectRatio: ratio,
+          minHeight: 260,
+          maxHeight: 260,
+          cards: [widget.card],
+          onFavorite: (_) => widget.onFavorite(),
+          onPositionChanged: (_, position) =>
+              widget.onPositionChanged?.call(position),
         );
       },
     ),

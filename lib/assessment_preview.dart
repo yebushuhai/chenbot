@@ -75,7 +75,7 @@ class _AssessmentPreviewState extends State<AssessmentPreview> {
             Text('示例答对 $correct / ${questions.length} 题。'),
             const SizedBox(height: 16),
             const Text(
-              '这几道示例题尚未经过标定，不能测算词汇量、S–H 等级或 JLPT 水平。正式评测需要更完整的题库。',
+              '这几道示例题尚未经过标定，不能测算词汇量、分级或 JLPT 水平。正式评测需要更完整的题库。',
               style: TextStyle(height: 1.6),
             ),
             const SizedBox(height: 24),

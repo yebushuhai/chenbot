@@ -7,6 +7,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:image/image.dart' as img;
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
   late Directory dir;
   late BatchStore store;
   setUp(() async {
@@ -77,5 +78,14 @@ void main() {
       throwsFormatException,
     );
     expect(await store.photos(), isEmpty);
+  });
+  test('an empty result stays available for an intentional retry', () async {
+    final photo = await store.addPhoto(
+      Uint8List.fromList(img.encodePng(img.Image(width: 4, height: 4))),
+      'en',
+    );
+    await store.saveResults(photo, []);
+    expect((await store.photos()).single['status'], 'no_match');
+    expect(await store.cards(), isEmpty);
   });
 }

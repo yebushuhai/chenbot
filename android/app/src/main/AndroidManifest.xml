@@ -3,7 +3,10 @@
     <application
         android:label="Chenbot"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/chenbot_icon"
+        android:roundIcon="@mipmap/chenbot_icon">
         <activity
             android:name=".MainActivity"
             android:exported="true"

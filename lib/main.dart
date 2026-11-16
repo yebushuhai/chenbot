@@ -1,14 +1,24 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart'
+    show LicenseRegistry, LicenseEntryWithLineBreaks, defaultTargetPlatform;
+import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'auth_page.dart';
-import 'dev_recognition.dart';
+import 'deepseek_recognition.dart';
+import 'deepseek_account.dart';
+import 'deepseek_settings.dart';
+import 'english_level.dart';
+import 'english_level_page.dart';
 import 'assessment_preview.dart';
 import 'batch_page.dart';
+import 'recognition_pipeline.dart';
+import 'reader_page.dart';
+import 'vocabulary.dart';
+import 'vocabulary_widgets.dart';
 
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter_tts/flutter_tts.dart';
@@ -21,6 +31,28 @@ import 'image_prepare.dart';
 bool authConfigured = false;
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  LicenseRegistry.addLicense(() async* {
+    yield LicenseEntryWithLineBreaks(
+      ['LemmInflect / SPECIALIST Lexicon'],
+      await rootBundle.loadString('assets/vocabulary/LEMMinflect_LICENSE.txt'),
+    );
+    yield LicenseEntryWithLineBreaks(
+      ['FrequencyWords — OpenSubtitles 2018'],
+      'Word-form ranks adapted from FrequencyWords by hermitdave and contributors. '
+      'First 500,000 English forms, counts removed; CC BY-SA 4.0. '
+      'Source: https://github.com/hermitdave/FrequencyWords\n\n'
+      '${await rootBundle.loadString('assets/vocabulary/CC_BY_SA_4.0.txt')}',
+    );
+    yield LicenseEntryWithLineBreaks(
+      ['ECDICT — English–Chinese dictionary'],
+      'Reading dictionary entries adapted from ECDICT. '
+      'Source: https://github.com/skywind3000/ECDICT\n\n'
+      '${await rootBundle.loadString('assets/reader/ECDICT_LICENSE.txt')}',
+    );
+    yield LicenseEntryWithLineBreaks([
+      'Gelasio',
+    ], await rootBundle.loadString('assets/fonts/Gelasio-OFL.txt'));
+  });
   const url = String.fromEnvironment('SUPABASE_URL');
   const key = String.fromEnvironment('SUPABASE_ANON_KEY');
   if (url.isNotEmpty && key.isNotEmpty) {
@@ -48,6 +80,14 @@ class Chenbot extends StatelessWidget {
       useMaterial3: true,
       colorScheme: ColorScheme.fromSeed(seedColor: moss, surface: paper),
       scaffoldBackgroundColor: paper,
+      // Georgia is built into iOS; Gelasio is an open-licensed substitute for
+      // Android, where Georgia is generally not supplied by the device.
+      fontFamily:
+          defaultTargetPlatform == TargetPlatform.iOS ||
+              defaultTargetPlatform == TargetPlatform.macOS
+          ? 'Georgia'
+          : 'Gelasio',
+      fontFamilyFallback: const ['Gelasio'],
       textTheme: const TextTheme(
         bodyMedium: TextStyle(color: ink),
         titleLarge: TextStyle(color: ink, fontWeight: FontWeight.w700),
@@ -128,43 +168,197 @@ class _HomeState extends State<Home> {
   Uint8List? _imageBytes;
   double _imageRatio = 1;
   bool _recognizing = false;
-  List<DetectedWord> _detected = [];
+  int _levelVersion = 0;
+  bool _deepSeekConfigured = false;
+  List<Map<String, dynamic>> _detected = [];
+  BatchStore? _singleStore;
+  String? _singlePhotoId;
   Future<void> recognize() async {
     final image = _imageBytes;
     if (image == null || _recognizing) return;
     final requestedJapanese = japanese;
+    String? key;
+    try {
+      key = await DeepSeekKeyStore(localScope).read();
+    } catch (_) {
+      if (mounted) unavailable('无法读取本机密钥，请检查 DeepSeek 识图设置。', title: '识别未完成');
+      return;
+    }
+    if (!mounted) return;
+    if (key == null || key.isEmpty) {
+      await openDeepSeekSettings();
+      return;
+    }
+    final scope = localScope;
+    EnglishLevelProfile? profile;
+    Map<String, bool> practice = {};
+    try {
+      profile = await EnglishLevelProfile.load(scope);
+      practice = await VocabularyPractice.load(scope);
+    } catch (_) {
+      // Do not upload English images without a valid difficulty preference.
+    }
+    if (!mounted) return;
+    if (!requestedJapanese && profile == null) {
+      unavailable('请先在识图按钮旁选择英语识图等级。', title: '请选择等级');
+      return;
+    }
+    final approved = await confirmDeepSeekUpload(context, 1, saveResults: true);
+    if (!approved || !mounted) return;
     setState(() {
       _recognizing = true;
       _detected = [];
+      _singleStore = null;
+      _singlePhotoId = null;
     });
+    final service = DeepSeekRecognition(
+      onUsage: DeepSeekUsageStore(scope).record,
+      englishLevel: profile?.band.difficulty,
+    );
     try {
-      final items = await DevRecognition.recognize(
-        image,
-        requestedJapanese ? 'ja' : 'en',
+      final root = await getApplicationDocumentsDirectory();
+      final store = BatchStore(Directory('${root.path}/chenbot_batch/$scope'));
+      final language = requestedJapanese ? 'ja' : 'en';
+      final result = await recognizeForLearner(
+        image: image,
+        language: language,
+        key: key,
+        service: service,
+        store: store,
+        englishLevel: profile?.band.difficulty,
+        practice: practice,
       );
+      final photo = await store.addPhoto(image, language);
+      await store.saveResults(photo, result.words);
+      final items = (await store.visibleCards())
+          .where((card) => card['photoId'] == photo['id'])
+          .toList();
       if (mounted &&
           identical(image, _imageBytes) &&
-          requestedJapanese == japanese) {
-        setState(() => _detected = items);
+          requestedJapanese == japanese &&
+          localScope == scope) {
+        setState(() {
+          _singleStore = store;
+          _singlePhotoId = photo['id'] as String;
+          _detected = items;
+        });
+        if (result.exhausted) {
+          unavailable(
+            result.noMatchingWords
+                ? '重新识别后，仍未找到词频表中符合当前等级或高一级的物品词。可以换张照片或调整等级。'
+                : result.noVisibleObject
+                ? '没有识别到清晰可命名的物品，请换一张照片或调整拍摄角度。'
+                : '这张照片的物品都在垃圾桶里，重试后没有新词。可以恢复垃圾桶里的词，或换一张照片。',
+            title: '暂时没有新词',
+          );
+        }
       }
+    } on DeepSeekException catch (error) {
+      if (mounted) unavailable(error.message, title: '识别未完成');
     } catch (_) {
-      if (mounted) unavailable('识别失败，请检查开发服务、网络和图片格式后重试。');
+      if (mounted) unavailable('识别失败，请检查网络和图片格式后重试。', title: '识别未完成');
     } finally {
+      service.close();
       if (mounted) setState(() => _recognizing = false);
     }
   }
 
-  Word detectedAsWord(DetectedWord w) => Word(
-    w.word,
-    w.word,
-    w.reading,
-    w.zh,
-    w.definition,
-    w.example,
-    w.example,
-    w.exampleZh,
+  Word detectedAsWord(Map<String, dynamic> w) => Word(
+    w['word'] as String,
+    w['word'] as String,
+    w['reading'] as String,
+    w['zh'] as String,
+    w['en_definition'] as String,
+    w['example'] as String,
+    w['example'] as String,
+    w['example_zh'] as String,
     Icons.label_outline,
   );
+
+  Future<void> favoriteDetected(Map<String, dynamic> card) async {
+    try {
+      await _singleStore!.favorite(card);
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('已收藏 ${card['word']}。')));
+      }
+    } catch (_) {
+      if (mounted) unavailable('收藏失败，请检查本机存储。');
+    }
+  }
+
+  Future<void> moveDetected(Map<String, dynamic> card, Offset position) async {
+    final store = _singleStore;
+    if (store == null) return;
+    try {
+      await store.moveLabel(card['id'] as String, position.dx, position.dy);
+      if (mounted && identical(store, _singleStore)) {
+        setState(() {
+          card['labelX'] = position.dx;
+          card['labelY'] = position.dy;
+        });
+      }
+    } catch (_) {
+      if (mounted) unavailable('无法保存单词位置，请检查本机存储。');
+    }
+  }
+
+  Future<void> refreshDetected() async {
+    final store = _singleStore;
+    final photoId = _singlePhotoId;
+    final scope = localScope;
+    if (store == null) return;
+    final visible = await store.visibleCards();
+    EnglishLevelProfile? profile;
+    try {
+      profile = await EnglishLevelProfile.load(scope);
+    } catch (_) {
+      // Without a valid selection no English cards can be shown.
+    }
+    if (mounted &&
+        identical(store, _singleStore) &&
+        photoId == _singlePhotoId &&
+        localScope == scope) {
+      setState(
+        () => _detected = visible
+            .where(
+              (card) =>
+                  card['photoId'] == photoId &&
+                  englishCardMatchesBand(card, profile?.band),
+            )
+            .toList(),
+      );
+    }
+  }
+
+  Future<void> discardDetected(Map<String, dynamic> card) async {
+    final store = _singleStore;
+    if (store == null) return;
+    try {
+      await store.discard(card['id'] as String);
+      await refreshDetected();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('已将 ${card['word']} 和已识别的词形放入垃圾桶。'),
+          action: SnackBarAction(
+            label: '撤销',
+            onPressed: () async {
+              try {
+                await store.restoreMatching(card);
+                await refreshDetected();
+              } catch (_) {
+                if (mounted) unavailable('恢复失败，请检查本机存储。');
+              }
+            },
+          ),
+        ),
+      );
+    } catch (_) {
+      if (mounted) unavailable('放入垃圾桶失败，请检查本机存储。');
+    }
+  }
+
   Future<void> pick(ImageSource source) async {
     try {
       final image = await _picker.pickImage(
@@ -186,6 +380,8 @@ class _HomeState extends State<Home> {
         _imageBytes = bytes;
         _imageRatio = ratio;
         _detected = [];
+        _singleStore = null;
+        _singlePhotoId = null;
       });
     } catch (_) {
       if (mounted) unavailable('无法打开相机或相册，请检查设备权限后重试。');
@@ -246,6 +442,26 @@ class _HomeState extends State<Home> {
   void initState() {
     super.initState();
     _loadSaved();
+    refreshDeepSeekSettings();
+  }
+
+  Future<void> refreshDeepSeekSettings() async {
+    try {
+      final present = await DeepSeekKeyStore(localScope).hasKey();
+      if (mounted) setState(() => _deepSeekConfigured = present);
+    } catch (_) {
+      if (mounted) setState(() => _deepSeekConfigured = false);
+    }
+  }
+
+  Future<void> openDeepSeekSettings() async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => DeepSeekSettingsPage(scope: localScope),
+      ),
+    );
+    if (mounted) await refreshDeepSeekSettings();
   }
 
   Future<void> _loadSaved() async {
@@ -269,6 +485,8 @@ class _HomeState extends State<Home> {
     setState(() {
       japanese = value;
       _detected = [];
+      _singleStore = null;
+      _singlePhotoId = null;
     });
     _writeQueue = _writeQueue
         .then((_) async {
@@ -327,6 +545,35 @@ class _HomeState extends State<Home> {
     }
   }
 
+  Future<void> openTrash() async {
+    try {
+      final root = await getApplicationDocumentsDirectory();
+      if (!mounted) return;
+      final store = BatchStore(
+        Directory('${root.path}/chenbot_batch/$localScope'),
+      );
+      await Navigator.push<void>(
+        context,
+        MaterialPageRoute(builder: (_) => LocalTrashPage(store: store)),
+      );
+      await refreshDetected();
+    } catch (_) {
+      if (mounted) unavailable('无法读取单词垃圾桶。');
+    }
+  }
+
+  Future<void> openAssessment({bool forJapanese = false}) async {
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => forJapanese
+            ? const AssessmentPreview(japanese: true)
+            : EnglishLevelPage(scope: localScope),
+      ),
+    );
+    if (mounted) setState(() => _levelVersion++);
+  }
+
   Future<void> login() async {
     if (!authConfigured) {
       unavailable('邮箱登录服务尚未配置，请稍后再试。');
@@ -334,43 +581,64 @@ class _HomeState extends State<Home> {
     }
     await Navigator.of(context)
         .push<bool>(MaterialPageRoute(builder: (_) => const AuthPage()));
-    if (mounted) setState(() {});
+    if (mounted) {
+      setState(() {
+        _detected = [];
+        _singleStore = null;
+        _singlePhotoId = null;
+        _levelVersion++;
+      });
+      await refreshDeepSeekSettings();
+    }
   }
 
   Future<void> signOut() async {
     try {
       await Supabase.instance.client.auth.signOut();
-      if (mounted) setState(() {});
+      if (mounted) {
+        setState(() {
+          _detected = [];
+          _singleStore = null;
+          _singlePhotoId = null;
+          _levelVersion++;
+        });
+        await refreshDeepSeekSettings();
+      }
     } catch (_) {
       if (mounted) unavailable('退出登录失败，请稍后重试。');
     }
   }
 
-  void unavailable(String text) => showModalBottomSheet<void>(
-    context: context,
-    showDragHandle: true,
-    builder: (context) => Padding(
-      padding: const EdgeInsets.fromLTRB(24, 4, 24, 36),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text('功能准备中', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 12),
-          Text(text, style: const TextStyle(height: 1.6)),
-          const SizedBox(height: 18),
-          SizedBox(
-            width: double.infinity,
-            child: FilledButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('知道了'),
-            ),
+  void unavailable(String text, {String title = '功能准备中'}) =>
+      showModalBottomSheet<void>(
+        context: context,
+        showDragHandle: true,
+        builder: (context) => Padding(
+          padding: const EdgeInsets.fromLTRB(24, 4, 24, 36),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 12),
+              Text(text, style: const TextStyle(height: 1.6)),
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('知道了'),
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
-    ),
-  );
-  void detail(Word w, {bool canSave = true}) => showModalBottomSheet<void>(
+        ),
+      );
+  void detail(
+    Word w, {
+    bool canSave = true,
+    bool isSample = true,
+  }) => showModalBottomSheet<void>(
     context: context,
     isScrollControlled: true,
     showDragHandle: true,
@@ -396,7 +664,11 @@ class _HomeState extends State<Home> {
                           ),
                         ),
                         Text(
-                          japanese ? w.reading : '英语 · 示例单词',
+                          japanese
+                              ? w.reading
+                              : isSample
+                              ? '英语 · 示例单词'
+                              : '英语 · AI 识图',
                           style: const TextStyle(color: Color(0xff768479)),
                         ),
                       ],
@@ -448,9 +720,9 @@ class _HomeState extends State<Home> {
                 style: const TextStyle(color: Color(0xff718176)),
               ),
               const SizedBox(height: 16),
-              const Text(
-                '示例内容，仅用于展示界面',
-                style: TextStyle(fontSize: 12, color: Color(0xff849086)),
+              Text(
+                isSample ? '示例内容，仅用于展示界面' : 'AI 生成内容，仅供学习参考',
+                style: const TextStyle(fontSize: 12, color: Color(0xff849086)),
               ),
             ],
           ),
@@ -461,8 +733,19 @@ class _HomeState extends State<Home> {
   @override
   Widget build(BuildContext context) => Scaffold(
     body: SafeArea(
-      child: IndexedStack(index: tab, children: [home(), library(), account()]),
+      child: IndexedStack(
+        index: tab,
+        children: [home(), library(), const ReaderShelf(), account()],
+      ),
     ),
+    floatingActionButton: tab == 0 && _detected.isNotEmpty
+        ? Material(
+            elevation: 5,
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(18),
+            child: TrashDropTarget(onDiscard: discardDetected),
+          )
+        : null,
     bottomNavigationBar: NavigationBar(
       selectedIndex: tab,
       onDestinationSelected: (i) => setState(() => tab = i),
@@ -478,6 +761,11 @@ class _HomeState extends State<Home> {
           label: '生词本',
         ),
         NavigationDestination(
+          icon: Icon(Icons.menu_book_outlined),
+          selectedIcon: Icon(Icons.menu_book),
+          label: '阅读',
+        ),
+        NavigationDestination(
           icon: Icon(Icons.person_outline),
           selectedIcon: Icon(Icons.person),
           label: '我的',
@@ -490,23 +778,27 @@ class _HomeState extends State<Home> {
     children: [
       Row(
         children: [
-          Container(
-            width: 38,
-            height: 38,
-            decoration: BoxDecoration(
-              color: moss,
-              borderRadius: BorderRadius.circular(13),
-            ),
-            child: const Icon(
-              Icons.auto_awesome,
-              color: Colors.white,
-              size: 20,
+          ClipRRect(
+            borderRadius: BorderRadius.circular(13),
+            child: Image.asset(
+              'assets/branding/home_icon.png',
+              width: 42,
+              height: 42,
+              cacheWidth: 180,
+              fit: BoxFit.cover,
+              excludeFromSemantics: true,
             ),
           ),
           const SizedBox(width: 10),
-          const Text(
+          Text(
             'chenbot',
             style: TextStyle(
+              fontFamily: Theme.of(context).platform == TargetPlatform.android
+                  ? 'sans-serif'
+                  : Typography.material2021(
+                      platform: Theme.of(context).platform,
+                    ).black.bodyMedium?.fontFamily,
+              fontFamilyFallback: const [],
               fontSize: 23,
               fontWeight: FontWeight.w800,
               letterSpacing: -.8,
@@ -596,67 +888,86 @@ class _HomeState extends State<Home> {
       ),
       if (_imageBytes != null) ...[
         const SizedBox(height: 18),
-        ClipRRect(
-          borderRadius: BorderRadius.circular(20),
-          child: AspectRatio(
-            aspectRatio: _imageRatio,
-            child: LayoutBuilder(
-              builder: (context, constraints) => Stack(
-                fit: StackFit.expand,
-                children: [
-                  Image.memory(_imageBytes!, fit: BoxFit.fill),
-                  for (final item in _detected.where(
-                    (item) => item.box != null,
-                  ))
-                    Positioned(
-                      left: (item.box![0] * constraints.maxWidth).clamp(
-                        0.0,
-                        (constraints.maxWidth - 120).clamp(
-                          0.0,
-                          constraints.maxWidth,
-                        ),
-                      ),
-                      top: (item.box![1] * constraints.maxHeight).clamp(
-                        0.0,
-                        (constraints.maxHeight - 40).clamp(
-                          0.0,
-                          constraints.maxHeight,
-                        ),
-                      ),
-                      child: ActionChip(
-                        label: Text(item.word, overflow: TextOverflow.ellipsis),
-                        onPressed: () =>
-                            detail(detectedAsWord(item), canSave: false),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ),
+        VocabularyPhotoCanvas(
+          image: Image.memory(_imageBytes!, fit: BoxFit.fill),
+          aspectRatio: _imageRatio,
+          cards: _detected,
+          onFavorite: favoriteDetected,
+          onPositionChanged: moveDetected,
         ),
         const SizedBox(height: 10),
-        if (DevRecognition.enabled) ...[
+        Text(
+          _deepSeekConfigured
+              ? '识别前会确认发送照片至 DeepSeek，调用可能产生费用。'
+              : '照片仅在本机预览；设置自己的 DeepSeek API Key 后可识图。',
+          style: const TextStyle(color: Color(0xff738279)),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            if (!japanese) ...[
+              Expanded(
+                child: IgnorePointer(
+                  ignoring: _recognizing,
+                  child: EnglishDifficultySelector(
+                    key: ValueKey('single-$localScope-$_levelVersion'),
+                    scope: localScope,
+                    onChanged: (_) => refreshDetected(),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+            ],
+            FilledButton.tonal(
+              onPressed: _recognizing
+                  ? null
+                  : (_deepSeekConfigured ? recognize : openDeepSeekSettings),
+              child: Text(
+                _recognizing
+                    ? '识别中…'
+                    : _deepSeekConfigured
+                    ? '识别照片'
+                    : '设置 API Key',
+              ),
+            ),
+          ],
+        ),
+        if (_detected.isNotEmpty) ...[
+          const SizedBox(height: 8),
           const Text(
-            '开发测试：识别会把照片发送至 DeepSeek，标签位置可能不准确。',
+            '点图片上的词收藏，拖动可调整位置或放入垃圾桶。',
             style: TextStyle(color: Color(0xff738279)),
           ),
           const SizedBox(height: 8),
-          FilledButton.tonal(
-            onPressed: _recognizing ? null : recognize,
-            child: Text(_recognizing ? '识别中…' : '开发测试：识别照片'),
-          ),
-          for (final item in _detected.where(
-            (item) => item.kind == 'adjective',
-          ))
-            ActionChip(
-              label: Text(item.word),
-              onPressed: () => detail(detectedAsWord(item), canSave: false),
+          for (final item in _detected)
+            ListTile(
+              title: Align(
+                alignment: Alignment.centerLeft,
+                child: VocabularyTag(
+                  card: item,
+                  onFavorite: () => favoriteDetected(item),
+                ),
+              ),
+              subtitle: Text(item['zh'] as String),
+              onTap: () =>
+                  detail(detectedAsWord(item), canSave: false, isSample: false),
+              trailing: Wrap(
+                spacing: 0,
+                children: [
+                  IconButton(
+                    onPressed: () => favoriteDetected(item),
+                    icon: const Icon(Icons.bookmark_add_outlined),
+                    tooltip: '收藏单词',
+                  ),
+                  IconButton(
+                    onPressed: () => discardDetected(item),
+                    icon: const Icon(Icons.delete_outline),
+                    tooltip: '放入垃圾桶',
+                  ),
+                ],
+              ),
             ),
-        ] else
-          const Text(
-            '照片仅在本机预览，AI 识别服务尚未接入。',
-            style: TextStyle(color: Color(0xff738279)),
-          ),
+        ],
       ],
       const SizedBox(height: 16),
       Card(
@@ -665,49 +976,19 @@ class _HomeState extends State<Home> {
           title: const Text('批量照片识词'),
           subtitle: const Text('多张照片 · 本机卡片与收藏'),
           trailing: const Icon(Icons.chevron_right),
-          onTap: () => Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) =>
-                  BatchPage(japanese: japanese, storageScope: localScope),
-            ),
-          ),
+          onTap: () async {
+            await Navigator.push<void>(
+              context,
+              MaterialPageRoute(
+                builder: (_) =>
+                    BatchPage(japanese: japanese, storageScope: localScope),
+              ),
+            );
+            await refreshDetected();
+            if (mounted) setState(() => _levelVersion++);
+          },
         ),
       ),
-      const SizedBox(height: 24),
-      Card(
-        child: ListTile(
-          leading: const Icon(Icons.quiz_outlined),
-          title: const Text('体验水平测试'),
-          subtitle: const Text('示例题 · 暂不估算词汇量'),
-          trailing: const Icon(Icons.chevron_right),
-          onTap: () => Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => AssessmentPreview(japanese: japanese),
-            ),
-          ),
-        ),
-      ),
-      const SizedBox(height: 30),
-      const Row(
-        children: [
-          Expanded(
-            child: Text(
-              '先看看如何学习',
-              style: TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
-            ),
-          ),
-          Text('示例', style: TextStyle(color: Color(0xff809085))),
-        ],
-      ),
-      const SizedBox(height: 12),
-      const Text(
-        '点击下面的示例单词，看看释义和例句。',
-        style: TextStyle(color: Color(0xff738279)),
-      ),
-      const SizedBox(height: 14),
-      ...words.map((w) => wordTile(w)),
     ],
   );
   Widget wordTile(Word w) => Padding(
@@ -748,37 +1029,24 @@ class _HomeState extends State<Home> {
         '生词本',
         style: TextStyle(fontSize: 30, fontWeight: FontWeight.w800),
       ),
-      const SizedBox(height: 8),
-      const Text('把想记住的词留在这里。', style: TextStyle(color: Color(0xff738279))),
       const SizedBox(height: 20),
       Card(
         child: ListTile(
           leading: const Icon(Icons.bookmark_outline),
-          title: const Text('批量识词收藏'),
+          title: const Text('识词收藏'),
           subtitle: const Text('查看单独保存的词条'),
           trailing: const Icon(Icons.chevron_right),
           onTap: openBatchFavorites,
         ),
       ),
-      const SizedBox(height: 16),
-      const Text('示例收藏', style: TextStyle(fontWeight: FontWeight.w700)),
-      const SizedBox(height: 10),
-      if (saved.isEmpty)
-        const Card(
-          child: Padding(
-            padding: EdgeInsets.all(25),
-            child: Text(
-              '还没有收藏单词。\n试着打开首页的示例并点击书签。',
-              style: TextStyle(height: 1.7),
-            ),
-          ),
-        )
-      else
-        ...words.where((w) => saved.contains(w.english)).map(wordTile),
-      const SizedBox(height: 12),
-      const Text(
-        '示例收藏保存在本机，账号同步尚未接入。',
-        style: TextStyle(color: Color(0xff829087), fontSize: 12),
+      Card(
+        child: ListTile(
+          leading: const Icon(Icons.delete_outline),
+          title: const Text('单词垃圾桶'),
+          subtitle: const Text('查看已过滤词形，恢复误丢的单词'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: openTrash,
+        ),
       ),
     ],
   );
@@ -803,7 +1071,7 @@ class _HomeState extends State<Home> {
               ),
               const SizedBox(height: 8),
               const Text(
-                '登录后同步单词与识图额度。',
+                '账号登录和同步服务尚未接入。',
                 style: TextStyle(color: Color(0xff738279)),
               ),
               const SizedBox(height: 14),
@@ -826,6 +1094,27 @@ class _HomeState extends State<Home> {
       ),
       const SizedBox(height: 16),
       Card(
+        child: ListTile(
+          leading: const Icon(Icons.key_outlined),
+          title: const Text('DeepSeek 识图设置'),
+          subtitle: Text(
+            _deepSeekConfigured ? '已在本机保存 API Key' : '使用自己的 API Key 识图',
+          ),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: openDeepSeekSettings,
+        ),
+      ),
+      const SizedBox(height: 16),
+      Card(
+        child: ListTile(
+          leading: const Icon(Icons.school_outlined),
+          title: const Text('英语水平测试'),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: openAssessment,
+        ),
+      ),
+      const SizedBox(height: 16),
+      Card(
         child: Column(
           children: [
             ListTile(
@@ -833,13 +1122,22 @@ class _HomeState extends State<Home> {
               title: const Text('识图额度'),
               subtitle: const Text('额度服务尚未接入'),
               trailing: const Icon(Icons.chevron_right),
-              onTap: () => unavailable('免费额度和充值尚未开放，当前不会产生收费。'),
+              onTap: () => unavailable(
+                'Chenbot 额度和充值尚未开放；使用自己的 API Key 识图可能产生 DeepSeek 费用。',
+              ),
             ),
             ListTile(
               leading: const Icon(Icons.privacy_tip_outlined),
               title: const Text('隐私与数据'),
               trailing: const Icon(Icons.chevron_right),
               onTap: () => unavailable('正式版本将说明照片处理、保存期限和账号删除方式。'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.description_outlined),
+              title: const Text('词频数据与开源许可'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () =>
+                  showLicensePage(context: context, applicationName: 'Chenbot'),
             ),
           ],
         ),

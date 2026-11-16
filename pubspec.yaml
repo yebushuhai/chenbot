@@ -41,6 +41,7 @@ dependencies:
   http: ^1.6.0
   path_provider: ^2.1.6
   image: ^4.12.0
+  flutter_secure_storage: ^11.2.0
 
 dev_dependencies:
   flutter_test:
@@ -63,6 +64,40 @@ flutter:
   # included with your application, so that you can use the icons in
   # the material Icons class.
   uses-material-design: true
+
+  assets:
+    - assets/vocabulary/english_inflections.csv.gz
+    - assets/vocabulary/english_subtitles_top200k.txt.gz
+    - assets/vocabulary/english_subtitles_top500k.txt.gz
+    - assets/vocabulary/LEMMinflect_LICENSE.txt
+    - assets/vocabulary/CC_BY_SA_4.0.txt
+    - assets/reader/
+    - assets/branding/
+    - assets/fonts/Gelasio-OFL.txt
+
+  fonts:
+    - family: Gelasio
+      fonts:
+        - asset: assets/fonts/Gelasio-Regular.ttf
+          weight: 400
+        - asset: assets/fonts/Gelasio-Italic.ttf
+          weight: 400
+          style: italic
+        - asset: assets/fonts/Gelasio-Medium.ttf
+          weight: 500
+        - asset: assets/fonts/Gelasio-MediumItalic.ttf
+          weight: 500
+          style: italic
+        - asset: assets/fonts/Gelasio-SemiBold.ttf
+          weight: 600
+        - asset: assets/fonts/Gelasio-SemiBoldItalic.ttf
+          weight: 600
+          style: italic
+        - asset: assets/fonts/Gelasio-Bold.ttf
+          weight: 700
+        - asset: assets/fonts/Gelasio-BoldItalic.ttf
+          weight: 700
+          style: italic
 
   # To add assets to your application, add an assets section, like this:
   # assets:

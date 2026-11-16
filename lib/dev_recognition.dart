@@ -13,9 +13,31 @@ class DetectedWord {
     required this.example,
     required this.exampleZh,
     required this.box,
+    this.lemma = '',
+    this.forms = const [],
+    this.frequencyRank,
   });
   final String kind, word, reading, zh, definition, example, exampleZh;
   final List<double>? box;
+  final String lemma;
+  final List<String> forms;
+
+  /// Locally verified subtitle word-form position, never a model claim.
+  final int? frequencyRank;
+
+  DetectedWord withFrequencyRank(int rank) => DetectedWord(
+    kind: kind,
+    word: word,
+    reading: reading,
+    zh: zh,
+    definition: definition,
+    example: example,
+    exampleZh: exampleZh,
+    box: box,
+    lemma: lemma,
+    forms: forms,
+    frequencyRank: rank,
+  );
   factory DetectedWord.fromJson(Map<String, dynamic> value) {
     String text(String key) {
       final v = value[key];
@@ -55,6 +77,16 @@ class DetectedWord {
       example: text('example'),
       exampleZh: text('example_zh'),
       box: box,
+      lemma: value['lemma'] is String && (value['lemma'] as String).length <= 60
+          ? value['lemma'] as String
+          : '',
+      forms: value['forms'] is List
+          ? (value['forms'] as List)
+                .whereType<String>()
+                .where((s) => s.isNotEmpty && s.length <= 60)
+                .take(20)
+                .toList()
+          : const [],
     );
   }
 }
