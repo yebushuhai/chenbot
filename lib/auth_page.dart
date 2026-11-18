@@ -32,8 +32,8 @@ class _AuthPageState extends State<AuthPage> {
     try {
       await Supabase.instance.client.auth.signInWithOtp(email: value);
       if (mounted) setState(() => sent = true);
-    } on AuthException catch (e) {
-      if (mounted) setState(() => error = e.message);
+    } on AuthException {
+      if (mounted) setState(() => error = '请求未成功，请核对邮箱或验证码，稍后再试。');
     } catch (_) {
       if (mounted) setState(() => error = '发送失败，请检查网络后重试。');
     } finally {
@@ -57,8 +57,8 @@ class _AuthPageState extends State<AuthPage> {
         type: OtpType.email,
       );
       if (mounted) Navigator.pop(context, true);
-    } on AuthException catch (e) {
-      if (mounted) setState(() => error = e.message);
+    } on AuthException {
+      if (mounted) setState(() => error = '请求未成功，请核对邮箱或验证码，稍后再试。');
     } catch (_) {
       if (mounted) setState(() => error = '验证失败，请稍后重试。');
     } finally {
@@ -75,12 +75,14 @@ class _AuthPageState extends State<AuthPage> {
         children: [
           const SizedBox(height: 20),
           Text(
-            sent ? '查收验证码' : '登录你的学习空间',
+            sent ? '查收验证码' : '注册或登录 Chenbot',
             style: Theme.of(context).textTheme.headlineSmall,
           ),
           const SizedBox(height: 12),
           Text(
-            sent ? '验证码已发送至 ${email.text.trim()}。请查收邮件。' : '我们会向你的邮箱发送一次性验证码。',
+            sent
+                ? '验证码已发送至 ${email.text.trim()}。请查收邮件。'
+                : '首次验证邮箱会创建账号。每次登录使用邮箱验证码，无需设置密码。',
           ),
           const SizedBox(height: 24),
           TextField(

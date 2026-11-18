@@ -1,0 +1,8 @@
+# Use only as the third overlay with a host Nginx terminating public TLS.
+services:
+  matching-edge:
+    environment:
+      MATCHING_DOMAIN: "http://:8080"
+      MATCHING_TRUSTED_PROXY: ${MATCHING_TRUSTED_PROXY:?Set the exact host proxy address as seen in this Docker network}
+    ports: !override
+      - "127.0.0.1:18080:8080"

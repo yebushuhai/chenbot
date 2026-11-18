@@ -1,0 +1,74 @@
+# Overlay for the official supabase/docker self-hosted/v0.8.4 Compose bundle.
+services:
+  api-gw:
+    ports: !reset []
+    logging: { driver: none }
+  supavisor:
+    ports: !reset []
+  rest:
+    environment:
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      PGRST_LOG_LEVEL: crit
+    logging: { driver: none }
+  auth:
+    environment:
+      GOTRUE_JWT_KEYS: ${JWT_KEYS:-[]}
+      GOTRUE_MAILER_AUTOCONFIRM: "false"
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: "true"
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_MAILER_TEMPLATES_CONFIRMATION: http://matching-edge:8081/otp.html
+      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: http://matching-edge:8081/otp.html
+      GOTRUE_MAILER_OTP_EXP: "600"
+      GOTRUE_SMTP_MAX_FREQUENCY: 60s
+      GOTRUE_RATE_LIMIT_EMAIL_SENT: ${MATCHING_OTP_HOURLY_LIMIT:-30}
+    logging: { driver: none }
+  db:
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_min_duration_statement=-1
+      - -c
+      - log_min_duration_sample=-1
+      - -c
+      - log_transaction_sample_rate=0
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+      - -c
+      - log_duration=off
+      - -c
+      - pgaudit.log=none
+      - -c
+      - pgaudit.log_parameter=off
+      - -c
+      - auto_explain.log_min_duration=-1
+    logging: { driver: none }
+  matching-edge:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    environment:
+      MATCHING_DOMAIN: ${MATCHING_DOMAIN:?Set the public API hostname}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./chenbot-deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./chenbot-deploy/otp.html:/srv/mailer/otp.html:ro
+      - matching-caddy-data:/data
+      - matching-caddy-config:/config
+    logging: { driver: none }
+
+volumes:
+  matching-caddy-data:
+  matching-caddy-config:

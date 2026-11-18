@@ -1,0 +1,46 @@
+{
+	admin off
+	servers {
+		trusted_proxies static {$MATCHING_TRUSTED_PROXY:127.0.0.1/32}
+		trusted_proxies_strict
+	}
+}
+
+{$MATCHING_DOMAIN} {
+	# Leave access logging off. Forward only explicit mobile-client operations.
+	@rpc {
+		method POST
+		path /rest/v1/rpc/blind_join /rest/v1/rpc/blind_state /rest/v1/rpc/blind_act /rest/v1/rpc/secret_join /rest/v1/rpc/secret_state /rest/v1/rpc/secret_act /rest/v1/rpc/matching_me /rest/v1/rpc/matching_enroll /rest/v1/rpc/matching_connections /rest/v1/rpc/matching_messages /rest/v1/rpc/matching_send /rest/v1/rpc/matching_safety /rest/v1/rpc/matching_safety_history /rest/v1/rpc/matching_delete
+	}
+	@auth {
+		method POST
+		path /auth/v1/otp /auth/v1/verify /auth/v1/logout
+	}
+	@session {
+		method POST
+		path /auth/v1/token
+		query grant_type=refresh_token
+	}
+	@user {
+		method GET
+		path /auth/v1/user /auth/v1/settings
+	}
+	header Strict-Transport-Security "max-age=31536000"
+	route {
+		reverse_proxy @rpc api-gw:8000
+		reverse_proxy @auth api-gw:8000
+		reverse_proxy @session api-gw:8000
+		reverse_proxy @user api-gw:8000
+		respond 404
+	}
+}
+
+# No published Docker port. GoTrue uses a constant internal URL to load the OTP template.
+http://:8081 {
+	@template path /otp.html
+	handle @template {
+		root * /srv/mailer
+		file_server
+	}
+	respond 404
+}

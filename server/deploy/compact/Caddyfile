@@ -1,0 +1,57 @@
+{
+	admin off
+}
+
+http://:8080 {
+	@no_key not header apikey {$APP_KEY}
+	@rpc {
+		method POST
+		path /rest/v1/rpc/blind_join /rest/v1/rpc/blind_state /rest/v1/rpc/blind_act /rest/v1/rpc/secret_join /rest/v1/rpc/secret_state /rest/v1/rpc/secret_act /rest/v1/rpc/matching_me /rest/v1/rpc/matching_enroll /rest/v1/rpc/matching_connections /rest/v1/rpc/matching_messages /rest/v1/rpc/matching_send /rest/v1/rpc/matching_safety /rest/v1/rpc/matching_safety_history /rest/v1/rpc/matching_delete
+	}
+	@auth {
+		method POST
+		path /auth/v1/otp /auth/v1/verify /auth/v1/logout
+	}
+	@refresh {
+		method POST
+		path /auth/v1/token
+		expression `{http.request.uri.query} == 'grant_type=refresh_token'`
+	}
+	@user {
+		method GET
+		path /auth/v1/user /auth/v1/settings
+	}
+	header Cache-Control "no-store"
+	route {
+		request_body {
+			max_size 32KiB
+		}
+		respond @no_key 401
+		handle @rpc {
+			uri strip_prefix /rest/v1
+			reverse_proxy rest:3000
+		}
+		handle @auth {
+			uri strip_prefix /auth/v1
+			reverse_proxy auth:9999
+		}
+		handle @refresh {
+			uri strip_prefix /auth/v1
+			reverse_proxy auth:9999
+		}
+		handle @user {
+			uri strip_prefix /auth/v1
+			reverse_proxy auth:9999
+		}
+		respond 404
+	}
+}
+
+http://:8081 {
+	@template path /otp.html
+	handle @template {
+		root * /srv/mailer
+		file_server
+	}
+	respond 404
+}

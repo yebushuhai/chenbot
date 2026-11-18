@@ -3,11 +3,17 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart'
-    show LicenseRegistry, LicenseEntryWithLineBreaks, defaultTargetPlatform;
+    show
+        LicenseRegistry,
+        LicenseEntryWithLineBreaks,
+        defaultTargetPlatform,
+        kDebugMode;
 import 'package:flutter/services.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 import 'auth_page.dart';
+import 'matching/discovery_page.dart';
+import 'matching/session_storage.dart';
 import 'deepseek_recognition.dart';
 import 'deepseek_account.dart';
 import 'deepseek_settings.dart';
@@ -55,9 +61,24 @@ Future<void> main() async {
   });
   const url = String.fromEnvironment('SUPABASE_URL');
   const key = String.fromEnvironment('SUPABASE_ANON_KEY');
-  if (url.isNotEmpty && key.isNotEmpty) {
+  final endpoint = Uri.tryParse(url);
+  final allowLocalDebug =
+      kDebugMode &&
+      endpoint?.scheme == 'http' &&
+      {'localhost', '127.0.0.1', '::1', '10.0.2.2'}.contains(endpoint?.host);
+  if (endpoint != null &&
+      endpoint.host.isNotEmpty &&
+      (endpoint.scheme == 'https' || allowLocalDebug) &&
+      key.isNotEmpty) {
     try {
-      await Supabase.initialize(url: url, publishableKey: key);
+      await Supabase.initialize(
+        url: url,
+        publishableKey: key,
+        debug: false,
+        authOptions: FlutterAuthClientOptions(
+          localStorage: DeviceSessionStorage(endpoint),
+        ),
+      );
       authConfigured = true;
     } catch (_) {
       authConfigured = false;
@@ -735,7 +756,19 @@ class _HomeState extends State<Home> {
     body: SafeArea(
       child: IndexedStack(
         index: tab,
-        children: [home(), library(), const ReaderShelf(), account()],
+        children: [
+          home(),
+          library(),
+          const ReaderShelf(),
+          if (tab == 3)
+            DiscoveryPage(
+              client: authConfigured ? Supabase.instance.client : null,
+              login: login,
+            )
+          else
+            const SizedBox.shrink(),
+          account(),
+        ],
       ),
     ),
     floatingActionButton: tab == 0 && _detected.isNotEmpty
@@ -764,6 +797,11 @@ class _HomeState extends State<Home> {
           icon: Icon(Icons.menu_book_outlined),
           selectedIcon: Icon(Icons.menu_book),
           label: '阅读',
+        ),
+        NavigationDestination(
+          icon: Icon(Icons.explore_outlined),
+          selectedIcon: Icon(Icons.explore),
+          label: '发现',
         ),
         NavigationDestination(
           icon: Icon(Icons.person_outline),
@@ -1065,13 +1103,18 @@ class _HomeState extends State<Home> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text(
-                '你的学习空间',
+              Text(
+                authConfigured
+                    ? (Supabase.instance.client.auth.currentUser?.email
+                              ?.split('@')
+                              .first ??
+                          '你的账号')
+                    : '你的账号',
                 style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 8),
-              const Text(
-                '账号登录和同步服务尚未接入。',
+              Text(
+                authConfigured ? '邮箱验证码登录，学习记录保存在本机。' : '邮箱登录服务尚未配置。',
                 style: TextStyle(color: Color(0xff738279)),
               ),
               const SizedBox(height: 14),

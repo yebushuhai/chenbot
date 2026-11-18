@@ -1,0 +1,101 @@
+name: chenbot-matching
+x-runtime: &runtime
+  restart: unless-stopped
+  logging: { driver: none }
+  security_opt: ["no-new-privileges:true"]
+  pids_limit: 150
+
+services:
+  db:
+    <<: *runtime
+    image: ${PG_IMAGE:-docker.io/library/postgres:17.12-alpine@sha256:a77aa70e641402a21411b92b721c58d10f23b50ae5fdd2333efd22d166e1e5f7}
+    mem_limit: 400m
+    environment:
+      POSTGRES_DB: chenbot
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?}
+      POSTGRES_INITDB_ARGS: --encoding=UTF8 --locale=C --auth-host=scram-sha-256
+    volumes:
+      - chenbot-db:/var/lib/postgresql/data
+    command: [postgres, -c, shared_buffers=64MB, -c, max_connections=40, -c, work_mem=2MB, -c, maintenance_work_mem=32MB, -c, log_statement=none, -c, log_min_messages=fatal, -c, log_min_error_statement=panic, -c, log_parameter_max_length_on_error=0]
+    healthcheck:
+      test: [CMD, pg_isready, -q, -U, postgres, -d, chenbot]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+
+  auth:
+    <<: *runtime
+    image: ${AUTH_IMAGE:-docker.io/supabase/gotrue:v2.198.0@sha256:ba8c0c82c574756c835c696df2a2c698020cc408a42034013d3712e34de7964d}
+    mem_limit: 192m
+    environment:
+      GOMEMLIMIT: 125MiB
+      PORT: "9999"
+      GOTRUE_API_HOST: 0.0.0.0
+      API_EXTERNAL_URL: ${BASE_URL:?}/auth/v1
+      GOTRUE_SITE_URL: ${BASE_URL:?}
+      GOTRUE_DB_DRIVER: postgres
+      DATABASE_URL: postgres://chenbot_auth:${AUTH_PASSWORD:?}@db:5432/chenbot
+      DB_NAMESPACE: auth
+      GOTRUE_DB_MAX_POOL_SIZE: 7
+      GOTRUE_JWT_SECRET: ${JWT_SECRET:?}
+      GOTRUE_JWT_AUD: authenticated
+      GOTRUE_JWT_DEFAULT_GROUP_NAME: authenticated
+      GOTRUE_JWT_EXP: "3600"
+      GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP:-true}
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: ${ENABLE_EMAIL:-false}
+      GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED: "false"
+      GOTRUE_EXTERNAL_PHONE_ENABLED: "false"
+      GOTRUE_MAILER_AUTOCONFIRM: "false"
+      GOTRUE_MAILER_OTP_EXP: "600"
+      GOTRUE_RATE_LIMIT_EMAIL_SENT: ${OTP_HOURLY_LIMIT:-30}
+      GOTRUE_MAILER_TEMPLATES_CONFIRMATION: http://edge:8081/otp.html
+      GOTRUE_MAILER_TEMPLATES_MAGIC_LINK: http://edge:8081/otp.html
+      GOTRUE_SMTP_MAX_FREQUENCY: 60s
+      GOTRUE_SMTP_HOST: ${SMTP_HOST:-}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT:-465}
+      GOTRUE_SMTP_USER: ${SMTP_USER:-}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS:-}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL:-}
+      GOTRUE_SMTP_SENDER_NAME: Chenbot
+    healthcheck:
+      test: [CMD, wget, --no-verbose, --tries=1, --spider, http://127.0.0.1:9999/health]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+
+  rest:
+    <<: *runtime
+    image: ${REST_IMAGE:-docker.io/postgrest/postgrest:v16.6@sha256:5ce030c153500fe90ba157da4da8ba99ab51d3bc7b95e071bd0b544b67a632f7}
+    mem_limit: 160m
+    environment:
+      PGRST_DB_URI: postgres://chenbot_rest:${REST_PASSWORD:?}@db:5432/chenbot
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_DB_SCHEMAS: public
+      PGRST_DB_EXTRA_SEARCH_PATH: public
+      PGRST_DB_POOL: "7"
+      PGRST_JWT_SECRET: ${JWT_SECRET:?}
+      PGRST_JWT_AUD: authenticated
+      PGRST_SERVER_PORT: "3000"
+      PGRST_ADMIN_SERVER_PORT: "3001"
+      PGRST_ADMIN_SERVER_HOST: 127.0.0.1
+      PGRST_LOG_LEVEL: crit
+    healthcheck:
+      test: [CMD, postgrest, --ready]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+
+  edge:
+    <<: *runtime
+    image: ${CADDY_IMAGE:-docker.io/library/caddy:2.10.2-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d}
+    mem_limit: 96m
+    environment:
+      APP_KEY: ${APP_KEY:?}
+      GOMEMLIMIT: 64MiB
+    ports:
+      - "127.0.0.1:${LOOPBACK_PORT:-18080}:8080"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../otp.html:/srv/mailer/otp.html:ro
+volumes:
+  chenbot-db:
